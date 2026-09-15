@@ -626,11 +626,53 @@ tensor_t Tensor::view(const std::vector<size_t> &shape) const {
 
 // ---------------------------------------------------------------------------
 // 【Task-1.5】slice(dim, start, end)：沿第 dim 维切片，取 [start, end) 区间。
-// 见后续小问实现。
+//
+// 【什么是切片？】
+// 就像切蛋糕：一个 3×4 的张量，沿第 0 维切 [1,3)，得到第 1、2 两行，
+// 形状变成 2×4。Python 里就是 tensor[1:3, :]。
+//
+// 【核心思想：不复制数据！】
+// 切片后的张量（视图）和原张量**共享同一块内存**，只是：
+//   1. 该维的形状从 shape[dim] 变成 (end - start)；
+//   2. 数据起点前移：_offset += start * strides[dim] * elementSize；
+//   3. 其余维度的形状和步长完全不变。
+// 为什么 offset 要乘 elementSize？
+//   因为 _offset 的单位是**字节**（见 data() 的注释），
+//   而 start * strides[dim] 算出的是"元素个数"，必须乘上每个元素
+//   的字节数才能加到字节偏移上。这是新手最容易漏的一步。
+//
+// 注意：切片不改变 strides（各维"步伐"不变），只是起点变了 + 形状变了。
 // ---------------------------------------------------------------------------
 tensor_t Tensor::slice(size_t dim, size_t start, size_t end) const {
-    TO_BE_IMPLEMENTED();
-    return std::shared_ptr<Tensor>(new Tensor(_meta, _storage));
+    // 参数校验：
+    //   1. dim 必须是合法维度（< 维数）；
+    //   2. start < end（区间非空，左闭右开 [start, end)）；
+    //   3. end 不能超过该维的大小。
+    CHECK_ARGUMENT(dim < _meta.shape.size(),
+                   "Slice dim must be less than the number of dimensions");
+    CHECK_ARGUMENT(start < end,
+                   "Slice start must be less than end");
+    CHECK_ARGUMENT(end <= _meta.shape[dim],
+                   "Slice end must be less than or equal to the dimension size");
+
+    // 切片后该维度形状改变：先把旧形状复制一份（new_shape = _meta.shape 是
+    // vector 的拷贝构造，复制整个数组），再改第 dim 维为 end - start。
+    std::vector<size_t> new_shape = _meta.shape;
+    new_shape[dim] = end - start;
+
+    // 切片后数据的字节偏移量：
+    //   起点前移 start 个元素，每个元素在该维上占 strides[dim] 个"元素位"，
+    //   再乘以 elementSize 换算成字节。
+    //   static_cast<size_t>：把 strides[dim]（ptrdiff_t，有符号）转成
+    //   size_t（无符号）再相乘，避免符号问题。
+    size_t new_offset = _offset
+                        + start * static_cast<size_t>(_meta.strides[dim]) * elementSize();
+
+    // 步长不变（切片不改变各维的"步伐"），共享同一 storage。
+    // _meta.strides 直接传（这里会复制一份 strides vector，但数据不复制）。
+    // 返回的新张量与原张量指向同一块内存（_storage 是同一个 shared_ptr）。
+    TensorMeta meta{_meta.dtype, std::move(new_shape), _meta.strides};
+    return std::shared_ptr<Tensor>(new Tensor(std::move(meta), _storage, new_offset));
 }
 
 // ---------------------------------------------------------------------------

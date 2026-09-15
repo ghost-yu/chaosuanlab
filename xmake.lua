@@ -37,6 +37,10 @@ target("chaosuan-device")
     set_kind("static")
     add_deps("chaosuan-utils")
     add_deps("chaosuan-device-cpu")
+    if has_config("nv-gpu") then
+        -- 作业 4：开了 --nv-gpu=y 才编译并链接 CUDA Runtime API
+        add_deps("chaosuan-device-nvidia")
+    end
 
     set_languages("cxx17")
     set_warnings("all", "error")
@@ -83,6 +87,10 @@ target_end()
 target("chaosuan-ops")
     set_kind("static")
     add_deps("chaosuan-ops-cpu")
+    if has_config("nv-gpu") then
+        -- 作业 4：开了 --nv-gpu=y 才编译并链接 CUDA 算子
+        add_deps("chaosuan-ops-nvidia")
+    end
 
     set_languages("cxx17")
     set_warnings("all", "error")

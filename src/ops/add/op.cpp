@@ -4,6 +4,9 @@
 #include "../../utils.hpp"
 
 #include "cpu/add_cpu.hpp"
+#ifdef ENABLE_NVIDIA_API
+#include "nvidia/add_nvidia.cuh"
+#endif
 
 namespace chaosuan::ops {
 void add(tensor_t c, tensor_t a, tensor_t b) {
@@ -25,7 +28,7 @@ void add(tensor_t c, tensor_t a, tensor_t b) {
         return cpu::add(c->data(), a->data(), b->data(), c->dtype(), c->numel());
 #ifdef ENABLE_NVIDIA_API
     case CHAOSUAN_DEVICE_NVIDIA:
-        TO_BE_IMPLEMENTED();
+        TO_BE_IMPLEMENTED();   // 作业 4.2 填 nvidia::add(...)
         return;
 #endif
     default:

@@ -217,32 +217,32 @@ struct Qwen2Model {
         ensure_weights();  // 第一次推理前，先把 Python 填好的权重收编进来
 
         // ---- 1. 创建 index 张量（[ntoken]，I64），embedding 查表 ----
-        auto index = chaosuan::Tensor::create({ntoken}, CHAOSUAN_DTYPE_I64, CHAOSUAN_DEVICE_CPU, 0);
+        auto index = chaosuan::Tensor::create({ntoken}, CHAOSUAN_DTYPE_I64, device, device_id);
         index->load(token_ids);  // 把 int64 数据拷进张量
 
         // hidden = embedding(index, in_embed)：形状 [ntoken, hs]
-        auto hidden = chaosuan::Tensor::create({ntoken, hs}, dtype, CHAOSUAN_DEVICE_CPU, 0);
+        auto hidden = chaosuan::Tensor::create({ntoken, hs}, dtype, device, device_id);
         chaosuan::ops::embedding(hidden, index, in_embed);
 
         // ---- 2. 逐层前向 ----
         // pos_ids：这批新 token 的绝对位置 = [cache_len, cache_len+1, ...]
         auto pos = make_pos_ids(cache_len, ntoken);
-        auto pos_ids = chaosuan::Tensor::create({ntoken}, CHAOSUAN_DTYPE_I64, CHAOSUAN_DEVICE_CPU, 0);
+        auto pos_ids = chaosuan::Tensor::create({ntoken}, CHAOSUAN_DTYPE_I64, device, device_id);
         pos_ids->load(pos.data());
 
         for (size_t l = 0; l < nlayer; l++) {
             // ================= 注意力子层 =================
             // 2.1 归一化：h_norm = rms_norm(hidden)
-            auto h_norm = chaosuan::Tensor::create({ntoken, hs}, dtype, CHAOSUAN_DEVICE_CPU, 0);
+            auto h_norm = chaosuan::Tensor::create({ntoken, hs}, dtype, device, device_id);
             chaosuan::ops::rms_norm(h_norm, hidden, attn_norm_w[l], epsilon);
 
             // 2.2 三个线性投影得到 q/k/v
             //   q: [ntoken, nh*dh]；k: [ntoken, nkvh*dh]；v: [ntoken, nkvh*dh]
-            auto q = chaosuan::Tensor::create({ntoken, nh * dh}, dtype, CHAOSUAN_DEVICE_CPU, 0);
+            auto q = chaosuan::Tensor::create({ntoken, nh * dh}, dtype, device, device_id);
             chaosuan::ops::linear(q, h_norm, attn_q_w[l], attn_q_b[l]);
-            auto k = chaosuan::Tensor::create({ntoken, nkvh * dh}, dtype, CHAOSUAN_DEVICE_CPU, 0);
+            auto k = chaosuan::Tensor::create({ntoken, nkvh * dh}, dtype, device, device_id);
             chaosuan::ops::linear(k, h_norm, attn_k_w[l], attn_k_b[l]);
-            auto v = chaosuan::Tensor::create({ntoken, nkvh * dh}, dtype, CHAOSUAN_DEVICE_CPU, 0);
+            auto v = chaosuan::Tensor::create({ntoken, nkvh * dh}, dtype, device, device_id);
             chaosuan::ops::linear(v, h_norm, attn_v_w[l], attn_v_b[l]);
 
             // 2.3 重排成 3 维 [ntoken, nhead, dh]（view 是零拷贝视图，作业 1 的成果）
@@ -251,75 +251,93 @@ struct Qwen2Model {
             auto v3 = v->view({ntoken, nkvh, dh});
 
             // 2.4 旋转位置编码（只对 q 和 k，v 不需要位置编码）
-            auto qr = chaosuan::Tensor::create({ntoken, nh, dh}, dtype, CHAOSUAN_DEVICE_CPU, 0);
+            auto qr = chaosuan::Tensor::create({ntoken, nh, dh}, dtype, device, device_id);
             chaosuan::ops::rope(qr, q3, pos_ids, theta);
-            auto kr = chaosuan::Tensor::create({ntoken, nkvh, dh}, dtype, CHAOSUAN_DEVICE_CPU, 0);
+            auto kr = chaosuan::Tensor::create({ntoken, nkvh, dh}, dtype, device, device_id);
             chaosuan::ops::rope(kr, k3, pos_ids, theta);
 
             // 2.5 把新的 k/v 写入 KV-Cache：
             //     用 slice 取缓存中 [cache_len, cache_len+ntoken) 这段，然后 load 拷贝。
             //     slice 返回的视图 data() 正好指向缓存里对应偏移，load 按元素数拷贝。
             auto k_w = k_cache[l]->slice(0, cache_len, cache_len + ntoken);
-            k_w->load(kr->data());
             auto v_w = v_cache[l]->slice(0, cache_len, cache_len + ntoken);
-            v_w->load(v3->data());
+            // 【作业4 设备化】CPU 版直接 load（host→host 拷贝）。
+            // GPU 版 kr/v3 与缓存都在显存里，必须用 memcpy D2D（设备→设备），
+            // 不能走 load()（load 的语义固定是 H2D，host→设备）。
+            if (device == CHAOSUAN_DEVICE_NVIDIA) {
+                core::context().runtime().api()->memcpy_sync(
+                    k_w->data(), kr->data(), k_w->numel() * k_w->elementSize(), CHAOSUAN_MEMCPY_D2D);
+                core::context().runtime().api()->memcpy_sync(
+                    v_w->data(), v3->data(), v_w->numel() * v_w->elementSize(), CHAOSUAN_MEMCPY_D2D);
+            } else {
+                k_w->load(kr->data());
+                v_w->load(v3->data());
+            }
 
             // 2.6 拼接后的完整 KV 视图：缓存 [0, cache_len+ntoken) 部分
             auto k_full = k_cache[l]->slice(0, 0, cache_len + ntoken);
             auto v_full = v_cache[l]->slice(0, 0, cache_len + ntoken);
 
             // 2.7 自注意力（算子内部会处理因果掩码 + GQA）
-            auto attn = chaosuan::Tensor::create({ntoken, nh, dh}, dtype, CHAOSUAN_DEVICE_CPU, 0);
+            auto attn = chaosuan::Tensor::create({ntoken, nh, dh}, dtype, device, device_id);
             float scale = 1.0f / std::sqrt(static_cast<float>(dh));
             chaosuan::ops::self_attention(attn, qr, k_full, v_full, scale);
 
             // 2.8 o 投影：把注意力输出映射回 hidden 维度，再加残差
-            auto o = chaosuan::Tensor::create({ntoken, hs}, dtype, CHAOSUAN_DEVICE_CPU, 0);
+            auto o = chaosuan::Tensor::create({ntoken, hs}, dtype, device, device_id);
             chaosuan::ops::linear(o, attn->view({ntoken, nh * dh}), attn_o_w[l], nullptr);
             // 残差连接：hidden = hidden + o（add 算子输出新张量）
-            auto hidden2 = chaosuan::Tensor::create({ntoken, hs}, dtype, CHAOSUAN_DEVICE_CPU, 0);
+            auto hidden2 = chaosuan::Tensor::create({ntoken, hs}, dtype, device, device_id);
             chaosuan::ops::add(hidden2, hidden, o);
             hidden = hidden2;
 
             // ================= MLP 子层 =================
             // 2.9 归一化
-            auto h_norm2 = chaosuan::Tensor::create({ntoken, hs}, dtype, CHAOSUAN_DEVICE_CPU, 0);
+            auto h_norm2 = chaosuan::Tensor::create({ntoken, hs}, dtype, device, device_id);
             chaosuan::ops::rms_norm(h_norm2, hidden, mlp_norm_w[l], epsilon);
 
             // 2.10 SwiGLU：gate 和 up 两个投影 → 逐元素门控激活
-            auto gate = chaosuan::Tensor::create({ntoken, di}, dtype, CHAOSUAN_DEVICE_CPU, 0);
+            auto gate = chaosuan::Tensor::create({ntoken, di}, dtype, device, device_id);
             chaosuan::ops::linear(gate, h_norm2, mlp_gate_w[l], nullptr);
-            auto up = chaosuan::Tensor::create({ntoken, di}, dtype, CHAOSUAN_DEVICE_CPU, 0);
+            auto up = chaosuan::Tensor::create({ntoken, di}, dtype, device, device_id);
             chaosuan::ops::linear(up, h_norm2, mlp_up_w[l], nullptr);
-            auto glu = chaosuan::Tensor::create({ntoken, di}, dtype, CHAOSUAN_DEVICE_CPU, 0);
+            auto glu = chaosuan::Tensor::create({ntoken, di}, dtype, device, device_id);
             chaosuan::ops::swiglu(glu, gate, up);
 
             // 2.11 下降投影 + 残差
-            auto down = chaosuan::Tensor::create({ntoken, hs}, dtype, CHAOSUAN_DEVICE_CPU, 0);
+            auto down = chaosuan::Tensor::create({ntoken, hs}, dtype, device, device_id);
             chaosuan::ops::linear(down, glu, mlp_down_w[l], nullptr);
-            auto hidden3 = chaosuan::Tensor::create({ntoken, hs}, dtype, CHAOSUAN_DEVICE_CPU, 0);
+            auto hidden3 = chaosuan::Tensor::create({ntoken, hs}, dtype, device, device_id);
             chaosuan::ops::add(hidden3, hidden, down);
             hidden = hidden3;
         }
 
         // ---- 3. 最后一层归一化 ----
-        auto h_final = chaosuan::Tensor::create({ntoken, hs}, dtype, CHAOSUAN_DEVICE_CPU, 0);
+        auto h_final = chaosuan::Tensor::create({ntoken, hs}, dtype, device, device_id);
         chaosuan::ops::rms_norm(h_final, hidden, out_norm_w, epsilon);
 
         // ---- 4. logits = h_final @ out_embed^T：形状 [ntoken, voc] ----
-        auto logits = chaosuan::Tensor::create({ntoken, voc}, dtype, CHAOSUAN_DEVICE_CPU, 0);
+        auto logits = chaosuan::Tensor::create({ntoken, voc}, dtype, device, device_id);
         chaosuan::ops::linear(logits, h_final, out_embed, nullptr);
 
         // ---- 5. 取最后一个 token 的 logits 行做 argmax（贪心采样）----
         auto last_row = logits->slice(0, ntoken - 1, ntoken);  // [1, voc]
         auto last_1d = last_row->view({voc});                  // 拉平成 1D（argmax 要求 1D）
-        auto max_idx = chaosuan::Tensor::create({1}, CHAOSUAN_DTYPE_I64, CHAOSUAN_DEVICE_CPU, 0);
-        auto max_val = chaosuan::Tensor::create({1}, dtype, CHAOSUAN_DEVICE_CPU, 0);
+        auto max_idx = chaosuan::Tensor::create({1}, CHAOSUAN_DTYPE_I64, device, device_id);
+        auto max_val = chaosuan::Tensor::create({1}, dtype, device, device_id);
         chaosuan::ops::argmax(max_idx, max_val, last_1d);
 
         // ---- 6. 更新缓存长度，返回生成的下一个 token ----
         cache_len += ntoken;
-        // data() 返回 std::byte*（原始字节），要按 int64 读出来必须 reinterpret_cast。
+        // 【作业4 设备化】CPU 版：data() 就是 host 指针，直接解引用。
+        // GPU 版：data() 是显存地址，CPU 不能直接读（会段错误），
+        // 必须用 memcpy D2H（设备→host）拷回一个 int64 再返回。
+        if (device == CHAOSUAN_DEVICE_NVIDIA) {
+            int64_t next = 0;
+            core::context().runtime().api()->memcpy_sync(
+                &next, max_idx->data(), sizeof(int64_t), CHAOSUAN_MEMCPY_D2H);
+            return next;
+        }
         return *reinterpret_cast<int64_t *>(max_idx->data());
     }
 };
@@ -338,10 +356,12 @@ __C {
     struct ChaosuanQwen2Model *chaosuanQwen2ModelCreate(const ChaosuanQwen2Meta *meta,
                                                         chaosuanDeviceType_t device,
                                                         int *device_ids, int ndevice) {
-        // 本实现支持 CPU；设备数组参数在作业 3 暂不深究（作业 4 扩展多设备）。
+        // 作业 3 只支持 CPU；作业 4 起支持 NVIDIA（RTX 4090 单卡）。
+        // device_ids/ndevice：多卡分发参数，单卡作业直接用 device_id=0。
         (void)device_ids;
         (void)ndevice;
-        CHECK_ARGUMENT(device == CHAOSUAN_DEVICE_CPU, "Qwen2: only CPU supported in assignment 3.");
+        CHECK_ARGUMENT(device == CHAOSUAN_DEVICE_CPU || device == CHAOSUAN_DEVICE_NVIDIA,
+                       "Qwen2: only CPU/NVIDIA supported.");
         return reinterpret_cast<struct ChaosuanQwen2Model *>(new Qwen2Model(*meta, device, 0));
     }
 

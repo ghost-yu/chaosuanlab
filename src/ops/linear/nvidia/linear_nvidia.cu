@@ -103,29 +103,50 @@ cublasHandle_t get_cublas_handle() {
 
 constexpr int kBlockSize = 256;
 
-// F32：走 cuBLAS（业界标准做法）。
-void linear_f32_cublas(float *out, const float *in, const float *weight,
-                       const float *bias, size_t m, size_t n, size_t k) {
-    cublasHandle_t handle = get_cublas_handle();
-    const float alpha = 1.0f, beta = 0.0f;
-    // 见文件头注释：行主序 Y[m,n] = X[m,k] @ W[n,k]^T。
-    // 关键认知：行主序 [R,C] 的字节流 ≡ 列主序 [C,R] 的字节流（同一个内存换个读法）。
-    //   W 行主序 [n,k] → 列主序 [k,n]（行数 k，lda=k），要 W^T 的效果 → OP_T；
-    //   X 行主序 [m,k] → 列主序 [k,m]（行数 k，ldb=k），不转置 → OP_N；
-    //   Y 行主序 [m,n] → 列主序 [n,m]（行数 n，ldc=n），作为 C 输出。
-    // 数学验证：C[i'][j'] = Σ W[i'][kk]*X[j'][kk] = Y[j'][i']，内存字节完全一致。
-    cublasStatus_t st = cublasSgemm(handle,
-                                    CUBLAS_OP_T,        // op(W) = W^T（关键！）
-                                    CUBLAS_OP_N,        // op(X) = X
-                                    static_cast<int>(n), static_cast<int>(m), static_cast<int>(k),
-                                    &alpha,
-                                    weight, static_cast<int>(k),   // W 列主序 [k,n]，lda=k
-                                    in, static_cast<int>(k),       // X 列主序 [k,m]，ldb=k
-                                    &beta,
-                                    out, static_cast<int>(n));     // Y 列主序 [n,m]，ldc=n
-    if (st != CUBLAS_STATUS_SUCCESS) {
-        throw std::runtime_error("cublasSgemm failed");
+// 朴素 GEMM kernel：每个线程算一个输出元素 Y[m][n]。
+// 【为什么不用 cuBLAS 而是朴素 kernel？—— 数值一致性（坑 14）】
+//   cuBLAS 会按 GPU 友好的分块/树形顺序求和，舍入与我们 CPU 版的"逐 k 顺序累加"不同。
+//   单步看差异极小（~1e-4），但 KV-Cache 长序列（>50 token）会累积放大，
+//   最终某个 token 的 logits top-1 被翻转，导致 test_infer --test 逐 token 断言失败。
+//   朴素 kernel 内层严格按 k=0,1,2,... 顺序累加，浮点舍入与 CPU 版**完全相同**，
+//   因此数值行为与已通过测试的 CPU 版一致。
+//   代价：没有 cuBLAS 的分块优化，大矩阵较慢；但 1.5B 模型推理依然可用。
+//   若未来需要极致性能，可换回 cuBLAS 并接受对照偏差，或改用 bf16 计算贴近 HF。
+template <typename T>
+__global__ void linear_naive_kernel(T *out, const T *in, const T *weight, size_t m, size_t n, size_t k) {
+    // 全局线程 id → (row, col)：
+    //   row = 输出行（0..m-1），col = 输出列（0..n-1）。
+    size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (tid >= m * n) return;
+    size_t row = tid / n;
+    size_t col = tid % n;
+
+    // 逐 k 累加：Y[row][col] = Σ_k in[row][k] * weight[col][k]
+    // 求和顺序与 CPU 版完全一致（内层 k 从小到大），保证浮点舍入一致。
+    float acc = 0.0f;
+    const T *x_row = in + row * k;       // 输入第 row 行
+    const T *w_row = weight + col * k;   // 权重第 col 行（[n, k] 行主序）
+    for (size_t kk = 0; kk < k; kk++) {
+        // 【坑 15：显式"先乘后加、各自舍入"，与 CPU 版位级一致】
+        //   nvcc 默认 -fmad=true 会把 a*b+acc 融合成 FMA 指令（一次舍入）；
+        //   CPU 版（gcc）是"乘一次舍入、加一次舍入"两步。两边舍入次数不同，
+        //   结果差 1 ulp，长序列累积后会翻转 top-1 logit。
+        //   __fmul_rn / __fadd_rn 是"强制按 IEEE 舍入、禁止融合"的内建函数，
+        //   保证与 CPU 的浮点行为完全一致。性能略降（不能向量化 FMA），
+        //   但 1.5B 推理仍远快于 CPU，正确性优先。
+        acc = __fadd_rn(acc, __fmul_rn(to_float<T>(x_row[kk]), to_float<T>(w_row[kk])));
     }
+    out[row * n + col] = from_float<T>(acc);
+}
+
+
+
+// F32：走朴素 GEMM kernel（求和顺序与 CPU 版一致，保证长序列逐 token 对齐）。
+// 说明见 linear_naive_kernel 注释（坑 14：cuBLAS 数值与 CPU 不一致导致长序列翻转）。
+void linear_f32(float *out, const float *in, const float *weight,
+                const float *bias, size_t m, size_t n, size_t k) {
+    int grid = static_cast<int>((m * n + kBlockSize - 1) / kBlockSize);
+    linear_naive_kernel<float><<<grid, kBlockSize>>>(out, in, weight, m, n, k);
     if (bias) {
         add_bias_kernel<float><<<static_cast<int>((m * n + kBlockSize - 1) / kBlockSize), kBlockSize>>>(
             out, bias, m, n);
@@ -154,7 +175,7 @@ void linear(std::byte *out, const std::byte *in, const std::byte *weight, const 
             chaosuanDataType_t dtype, size_t m, size_t n, size_t k) {
     switch (dtype) {
     case CHAOSUAN_DTYPE_F32:
-        linear_f32_cublas(reinterpret_cast<float *>(out), reinterpret_cast<const float *>(in),
+        linear_f32(reinterpret_cast<float *>(out), reinterpret_cast<const float *>(in),
                           reinterpret_cast<const float *>(weight), reinterpret_cast<const float *>(bias),
                           m, n, k);
         break;

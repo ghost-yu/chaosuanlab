@@ -67,18 +67,44 @@ __global__ void rope_kernel(T *out, const T *in, const int64_t *pos_ids,
 
     float pos = static_cast<float>(pos_ids[s]);          // 本 token 的位置编号
     // freq[j] = theta^(2j/d)；angle = pos / freq = pos * theta^(-2j/d)
-    // 用 powf 直接算：powf(theta, 2.0f*j/d) 就是 theta^(2j/d)。
-    float angle = pos / powf(theta, 2.0f * static_cast<float>(j) / static_cast<float>(d));
-    float cos_val = cosf(angle);
-    float sin_val = sinf(angle);
+    // 【坑 15：cos/sin 用 double 精度计算，与 CPU 版位级一致】
+    //   CPU 版用 std::pow / std::cos / std::sin（内部 double 精度，正确舍入）；
+    //   GPU 的 powf / cosf / sinf 是 float 版近似，结果可能差 1 ulp。
+    //   1 ulp 单独看无所谓，但 rope 输出直接决定 attention 的 q/k 向量，
+    //   差异会被后续 linear/softmax 放大，28 层累积后长序列 top-1 翻转。
+    //   这里数据量小（seqlen × d/2 个角度），用 double 算完再转 float，
+    //   与 CPU 的 std::cos(float)（glibc 正确舍入）位级一致。
+    // 【坑 15 续：表达式必须与 CPU 版逐运算一致】
+    //   CPU 版：freq[j] = pow(theta, 2.0f * (float)j / (float)d) —— 指数是
+    //   **float 运算**；angle = pos / freq[j] —— **float 除法**。
+    //   这里必须照抄：
+    //   1) 指数 2.0f * j / d 先按 float 算（提升 double 前的值要和 CPU 相同）；
+    //   2) pow 用 double 精度（CPU 的 std::pow(float,float) → glibc powf，
+    //      是"正确舍入"的 float 结果；double 精度 pow 再转 float 与之位级一致）；
+    //   3) angle 用 float 除法（CPU 是 float 除 float）；
+    //   4) cos/sin 用 double 精度（CPU 的 std::cos(float) → 正确舍入的 float，
+    //      double 精度 cos 再转 float 与之位级一致）。
+    float freq = (float)pow((double)theta, (double)(2.0f * (float)j / (float)d));
+    float angle = pos / freq;
+    float cos_val = (float)cos((double)angle);
+    float sin_val = (float)sin((double)angle);
 
     // 同一个 (s, j) 下所有 head 共享角度 → 循环 head 复用 cos/sin。
     for (size_t h = 0; h < nheads; h++) {
         size_t base = s * nheads * d + h * d;   // 当前 (token, head) 向量起点
         float a = to_float<T>(in[base + j]);            // 前半分量
         float b = to_float<T>(in[base + half_d + j]);   // 后半分量
-        float ra = a * cos_val - b * sin_val;           // 旋转公式
-        float rb = b * cos_val + a * sin_val;
+        // 【坑 15 续：乘加/乘减显式分开舍入，禁止 FMA 融合】
+        //   nvcc -fmad=true 会把 a*cos - b*sin 融合成 FMA 指令（一次舍入），
+        //   CPU 版是"两次独立乘法 + 一次减法"（三次舍入）。舍入次数不同 →
+        //   结果差 1 ulp → 长序列累积翻转。用 __fmul_rn/__fsub_rn/__fadd_rn
+        //   强制各自按 IEEE 舍入，与 CPU 行为位级一致。
+        float t1 = __fmul_rn(a, cos_val);   // a * cos
+        float t2 = __fmul_rn(b, sin_val);   // b * sin
+        float t3 = __fmul_rn(b, cos_val);   // b * cos
+        float t4 = __fmul_rn(a, sin_val);   // a * sin
+        float ra = __fsub_rn(t1, t2);       // a*cos - b*sin
+        float rb = __fadd_rn(t3, t4);       // b*cos + a*sin
         out[base + j] = from_float<T>(ra);
         out[base + half_d + j] = from_float<T>(rb);
     }

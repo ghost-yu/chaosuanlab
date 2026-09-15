@@ -62,30 +62,25 @@ __global__ void rms_norm_kernel(T *out, const T *in, const T *weight,
     const T *in_row = in + row * d;         // 输入行起点
     T *out_row = out + row * d;             // 输出行起点
 
-    __shared__ float s_sum[kThreads];       // 每个线程的局部平方和
-
-    // ---- 第 1 遍：累加平方和（stride 步长访问，线程间负载均衡） ----
-    float sum = 0.0f;
-    for (size_t j = threadIdx.x; j < d; j += kThreads) {
-        float v = to_float<T>(in_row[j]);
-        sum += v * v;
-    }
-    s_sum[threadIdx.x] = sum;
-    __syncthreads();
-
-    // 树形归约：块内求和（和 argmax 的归约同套路，这里是"和"不是"最大"）。
-    for (int stride = kThreads / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) {
-            s_sum[threadIdx.x] += s_sum[threadIdx.x + stride];
-        }
-        __syncthreads();
-    }
-
-    // 线程 0 算 rms，写进共享内存广播给全块。
     __shared__ float s_rms;
+
+    // ---- 第 1 遍：累加平方和（线程 0 顺序累加，与 CPU 版位级一致） ----
+    // 【为什么不用树形归约？—— 数值一致性（坑 14）】
+    //   树形归约是"两两配对"求和，CPU 版是"从 0 到 d-1 逐元素"线性累加。
+    //   浮点加法的结合律不成立：同样的数，不同的求和顺序结果不同（最后几位）。
+    //   这个 ~1e-6 的相对误差单独看无所谓，但会被后面的 linear 放大
+    //   （sqrt(k) 量级），28 层累积后在长序列上把 top-1 logit 翻转，导致
+    //   test_infer --test 逐 token 断言失败。所以这里必须和 CPU 版一致：
+    //   d 只有 128，一行串行算也就 128 次加法，性能完全可接受。
     if (threadIdx.x == 0) {
-        s_rms = sqrtf(s_sum[0] / static_cast<float>(d) + eps);
-        // sqrtf 是 float 版开方（GPU 上 sqrt 双精度慢，float 场景用 sqrtf）
+        float sum_sq = 0.0f;
+        for (size_t j = 0; j < d; j++) {
+            float v = to_float<T>(in_row[j]);
+            sum_sq += v * v;
+        }
+        // 与 CPU 版表达式完全一致：sqrt(sum_sq / d + eps)。
+        // sqrtf 是 IEEE 正确舍入的 float 开方，与 CPU 的 sqrt 结果位级一致。
+        s_rms = sqrtf(sum_sq / static_cast<float>(d) + eps);
     }
     __syncthreads();
 

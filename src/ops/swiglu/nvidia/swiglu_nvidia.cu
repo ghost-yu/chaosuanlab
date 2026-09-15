@@ -3,7 +3,7 @@
 // ----------------------------------------------------------------------------
 // 【SwiGLU 是什么？】
 // 大模型 MLP 里用的激活函数（Llama/Qwen 都是）：
-//   out = gate * SiLU(up) = gate * (up / (1 + exp(-up)))
+//   out = up * SiLU(gate) = up * (gate / (1 + exp(-gate)))
 // 其中 SiLU(x) = x * sigmoid(x) = x / (1 + e^(-x))。
 // gate 和 up 是同一个输入矩阵经过两个不同 linear 的结果。
 //
@@ -60,9 +60,14 @@ __global__ void swiglu_kernel(T *out, const T *gate, const T *up, size_t numel) 
     if (i < numel) {
         float g = to_float<T>(gate[i]);     // 门控值
         float u = to_float<T>(up[i]);       // 上游值
-        // SiLU(u) = u / (1 + e^(-u))：注意 e^(-u) 用 expf（float 版 exp）。
-        float silu = u / (1.0f + expf(-u));
-        out[i] = from_float<T>(g * silu);   // gate * SiLU(up)
+        // 【与 CPU 版保持一致】Qwen2 的 MLP 是 silu(gate) * up：
+        //   gate 过 SiLU 当"门控"，up 原样通过。
+        //   SiLU(g) = g / (1 + e^(-g))；e^(-g) 用 expf（float 版 exp）。
+        // 【坑 15：exp 用 double 精度，与 CPU 版位级一致】
+        //   CPU 版 std::exp(float) 内部 double 正确舍入；GPU expf 可能差 1 ulp。
+        //   SwiGLU 输出直接进 down_proj（8960→1536 大矩阵），差异会被放大。
+        float silu_g = g / (1.0f + (float)exp((double)(-g)));
+        out[i] = from_float<T>(u * silu_g);  // up * SiLU(gate)
     }
 }
 

@@ -89,12 +89,16 @@ __global__ void self_attention_kernel(T *attn_val, const T *q, const T *k, const
             continue;
         }
         // 点积：q 的第 (i,h) 行 × k 的第 (j,kh) 行
+        // 【坑 15 续：点积累加显式分开舍入，禁止 FMA 融合】
+        //   与 linear 同理：nvcc 会把 dot += q*k 融合成 FMA（一次舍入），
+        //   CPU 版是"乘一次、加一次"（两次舍入）。__fmul_rn/__fadd_rn
+        //   强制与 CPU 位级一致。
         float dot = 0.0f;
         for (size_t dim = 0; dim < d; dim++) {
-            dot += to_float<T>(q[i * nhead * d + h * d + dim]) *
-                   to_float<T>(k[j * nkvhead * d + kh * d + dim]);
+            dot = __fadd_rn(dot, __fmul_rn(to_float<T>(q[i * nhead * d + h * d + dim]),
+                                           to_float<T>(k[j * nkvhead * d + kh * d + dim])));
         }
-        dot *= scale;
+        dot = __fmul_rn(dot, scale);   // 缩放也按"单独一次乘法"舍入
         my_scores[j] = dot;
         if (dot > max_score) max_score = dot;
     }
@@ -104,7 +108,11 @@ __global__ void self_attention_kernel(T *attn_val, const T *q, const T *k, const
     // -----------------------------------------------------------------------
     float sum_exp = 0.0f;
     for (size_t j = 0; j < total_len; j++) {
-        float e = (my_scores[j] == -INFINITY) ? 0.0f : expf(my_scores[j] - max_score);
+        // 【坑 15：exp 用 double 精度，与 CPU 版位级一致】
+        //   CPU 版 std::exp(float) 内部 double 精度正确舍入；GPU expf 是
+        //   float 近似，可能差 1 ulp。softmax 权重差 1 ulp 会在长序列累积，
+        //   这里每线程 total_len 次 exp，数据量小，用 double 算再转 float。
+        float e = (my_scores[j] == -INFINITY) ? 0.0f : (float)exp((double)(my_scores[j] - max_score));
         my_scores[j] = e;
         sum_exp += e;
     }
@@ -116,14 +124,26 @@ __global__ void self_attention_kernel(T *attn_val, const T *q, const T *k, const
         float val = 0.0f;
         for (size_t j = 0; j < total_len; j++) {
             if (my_scores[j] > 0.0f) {     // 掩码位置权重为 0，跳过
-                val += my_scores[j] * to_float<T>(v[j * nkvhead * dv + kh * dv + dim]);
+                // 与点积同理：显式分开舍入，禁止 FMA 融合。
+                val = __fadd_rn(val, __fmul_rn(my_scores[j], to_float<T>(v[j * nkvhead * dv + kh * dv + dim])));
             }
         }
         attn_val[i * nhead * dv + h * dv + dim] = from_float<T>(val / sum_exp);
     }
 }
 
-constexpr int kBlockSize = 256;
+// 【坑 16：kBlockSize 必须足够小，防止动态共享内存超限】
+//   动态共享内存 = kBlockSize × total_len × 4 字节。
+//   默认每 block 共享内存上限 48KB（49152 B）。
+//   旧值 256：total_len 达到 49 时 256×49×4 = 50176 B > 49152 B，
+//   CUDA 核**启动失败**（launch failure）。而 launch 后只调了
+//   cudaDeviceSynchronize() 没查错误 → 失败被**静默吞掉**，
+//   输出张量是垃圾值 → 模型从第 50 个 token 开始乱码。
+//   修复：kBlockSize=64 → 64×137×4 = 35KB < 48KB（128 步生成，
+//   total_len ≤ 137），且 launch 后必须查 cudaGetLastError。
+//   若未来 total_len 更大，可进一步缩小 kBlockSize 或调用
+//   cudaFuncSetAttribute 提高动态共享内存上限（需要显式 opt-in）。
+constexpr int kBlockSize = 64;
 
 template <typename T>
 void launch_self_attention(void *attn_val, const void *q, const void *k, const void *v,
@@ -136,6 +156,14 @@ void launch_self_attention(void *attn_val, const void *q, const void *k, const v
     self_attention_kernel<T><<<grid, kBlockSize, smem_bytes>>>(
         static_cast<T *>(attn_val), static_cast<const T *>(q), static_cast<const T *>(k),
         static_cast<const T *>(v), scale, seqlen, total_len, nhead, nkvhead, d, dv);
+    // 【坑 16 续：必须检查核启动错误！】
+    //   cudaGetLastError 返回最近一次异步启动的错误（如共享内存超限），
+    //   不检查的话错误会被后续调用覆盖，留下"看起来正常但结果全错"的坑。
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        throw std::runtime_error("self_attention kernel launch failed: " +
+                                 std::string(cudaGetErrorString(err)));
+    }
     cudaDeviceSynchronize();
 }
 

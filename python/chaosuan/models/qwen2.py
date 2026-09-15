@@ -45,9 +45,11 @@ except ImportError as e:  # pragma: no cover
 class Qwen2:
     """用 CHAOSUAN 后端加载并运行 DeepSeek-R1-Distill-Qwen-1.5B。"""
 
-    def __init__(self, model_path, device: DeviceType = DeviceType.CPU):
-        # 只支持 CPU（作业 3 范围；作业 4 扩展 NVIDIA）。
-        assert device == DeviceType.CPU, "Qwen2: assignment 3 supports CPU only."
+    def __init__(self, model_path, device: DeviceType = DeviceType.CPU, device_id: int = 0):
+        # 作业 3 只支持 CPU；作业 4 起支持 NVIDIA（RTX 4090）。
+        # device_id：多卡时的 GPU 编号，本项目只适配单卡（4090），恒为 0。
+        self._device = device
+        self._device_id = device_id
 
         model_path = Path(model_path)
 
@@ -98,13 +100,14 @@ class Qwen2:
                 shape_arr,
                 ndim,
                 DataType.F32,    # 权重统一存成 f32（bf16→f32 无损，计算精度对齐 HF）
-                DeviceType.CPU,
-                0,
+                self._device,    # 权重张量直接建在目标设备（CPU 或 NVIDIA）上
+                self._device_id,
             )
             # 取 f32 字节：bf16 → f32 是精确转换（bf16 就是 f32 截断的尾数），
             # 用 torch 的 .float() 完成，再按 4 字节读出。
             raw = arr.contiguous().float().numpy().tobytes()
             buf = ctypes.create_string_buffer(raw)
+            # tensorLoad 内部是 memcpy H2D：host 权重数据 → 设备张量（GPU 时自动走 cudaMemcpy）。
             LIB_CHAOSUAN.tensorLoad(t, buf)
             return t
 
@@ -169,8 +172,8 @@ class Qwen2:
         # C++ 会在第一次 infer 时统一"收编"这些权重。
         self._model = LIB_CHAOSUAN.chaosuanQwen2ModelCreate(
             ctypes.byref(self._meta),
-            DeviceType.CPU,
-            None,  # 设备 id 数组（作业 3 用不到）
+            self._device,       # CPU 或 NVIDIA
+            None,               # 设备 id 数组（单卡作业不涉及多设备分发）
             0,
         )
         w_ptr = LIB_CHAOSUAN.chaosuanQwen2ModelWeights(self._model)

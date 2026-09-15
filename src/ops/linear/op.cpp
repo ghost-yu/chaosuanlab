@@ -64,7 +64,7 @@ void linear(tensor_t out, tensor_t in, tensor_t weight, tensor_t bias) {
         return cpu::linear(out->data(), in->data(), weight->data(), bias ? bias->data() : nullptr, out->dtype(), m, n, k);
 #ifdef ENABLE_NVIDIA_API
     case CHAOSUAN_DEVICE_NVIDIA:
-        TO_BE_IMPLEMENTED();
+        return nvidia::linear(out->data(), in->data(), weight->data(), bias ? bias->data() : nullptr, out->dtype(), m, n, k);
         return;
 #endif
     default:

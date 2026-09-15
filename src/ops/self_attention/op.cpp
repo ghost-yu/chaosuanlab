@@ -64,7 +64,8 @@ void self_attention(tensor_t attn_val, tensor_t q, tensor_t k, tensor_t v, float
                                    seqlen, total_len, nhead, nkvhead, d, dv);
 #ifdef ENABLE_NVIDIA_API
     case CHAOSUAN_DEVICE_NVIDIA:
-        TO_BE_IMPLEMENTED();
+        return nvidia::self_attention(attn_val->data(), q->data(), k->data(), v->data(), scale, attn_val->dtype(),
+                                   seqlen, total_len, nhead, nkvhead, d, dv);
         return;
 #endif
     default:

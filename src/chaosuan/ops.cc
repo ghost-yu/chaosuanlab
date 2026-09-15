@@ -23,7 +23,9 @@ __C {
         chaosuan::ops::embedding(out->tensor, index->tensor, weight->tensor);
     }
     void chaosuanLinear(chaosuanTensor_t out, chaosuanTensor_t in, chaosuanTensor_t weight, chaosuanTensor_t bias) {
-        chaosuan::ops::linear(out->tensor, in->tensor, weight->tensor, bias->tensor);
+        // bias 是可选参数：ctypes 传 None 时这里收到 NULL，必须先判空再解引用，
+        // 否则 bias->tensor 会段错误（作业 4 踩过的坑，见教学笔记）。
+        chaosuan::ops::linear(out->tensor, in->tensor, weight->tensor, bias ? bias->tensor : nullptr);
     }
     void chaosuanRearrange(chaosuanTensor_t out, chaosuanTensor_t in) {
         chaosuan::ops::rearrange(out->tensor, in->tensor);

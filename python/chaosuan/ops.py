@@ -20,8 +20,13 @@ class Ops:
 
     @staticmethod
     def linear(out: Tensor, inp: Tensor, weight: Tensor, bias: Tensor):
+        # bias 可为 None（没有偏置的线性层）；ctypes 里 None 自动变成空指针 nullptr，
+        # C 侧 chaosuanLinear 收到 nullptr 就跳过加偏置。
         LIB_CHAOSUAN.chaosuanLinear(
-            out.lib_tensor(), inp.lib_tensor(), weight.lib_tensor(), bias.lib_tensor()
+            out.lib_tensor(),
+            inp.lib_tensor(),
+            weight.lib_tensor(),
+            bias.lib_tensor() if bias is not None else None,
         )
 
     @staticmethod

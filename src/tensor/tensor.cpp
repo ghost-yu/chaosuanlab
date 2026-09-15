@@ -418,12 +418,159 @@ tensor_t Tensor::permute(const std::vector<size_t> &order) const {
 }
 
 // ---------------------------------------------------------------------------
-// 【Task-1.3】view(shape)：重塑视图（reshape，不复制数据）。
-// 见后续小问实现。
+// 【Task-1.3】view(shape)：重塑视图（reshape，但不复制数据）。
+//
+// 【目标】
+// 把张量"换一种形状解释"，同时**不复制数据**。比如把 2×3×5 看成 2×15。
+// 成功的关键约束：新形状的元素总数必须等于旧形状（2*3*5 == 2*15），
+// 且新视图必须与旧张量的内存布局"兼容"——也就是说，在不搬数据的前提下
+// 能表达出新形状的连续排列（或至少是合法的非连续排列）。
+//
+// 【为什么不是随便改形状就行？】
+// 例：一个连续的张量 (2,3,5)（步长 {15,5,1}），内存是紧密的一排 30 个元素，
+// 可以 view 成任何"元素总数相同"的形状（2×15、3×10、30…），因为内存怎么分段都行。
+// 但如果先 permute 变成不连续（步长 {1,15,5} 这种），内存就不是紧密排列了，
+// 此时想 view 成 (2,15) 就**做不到**：新形状要求元素按 15 个一组连续，
+// 但内存里元素是跳着放的。本函数要检测并拒绝这种操作。
+//
+// 【算法：块（chunk）对齐】
+// 把旧张量从最后一维往前进，切成若干"连续块"（chunk）：
+//   一个块 = 内存里连续的一段元素（在块内，步长是连续排列的）。
+// 块在哪里断开？当某个维度的步长不等于"连续应走的步长"时断开。
+// 然后从新形状的最后一维往前，逐个"消耗"这些块，算出每个新维度的步长。
+// 如果某个块的元素数和新维度对不上，说明不兼容，报错。
+//
+// 更直观的理解：这就像把一串珠子（旧张量的内存）重新分成若干段
+// （新形状的各维）。只要"断点"能对齐，就能成功；对不齐就失败。
 // ---------------------------------------------------------------------------
 tensor_t Tensor::view(const std::vector<size_t> &shape) const {
-    TO_BE_IMPLEMENTED();
-    return std::shared_ptr<Tensor>(new Tensor(_meta, _storage));
+    const size_t old_numel = this->numel();   // 旧元素总数（旧 shape 各维乘积）
+    const size_t new_numel = std::accumulate(   // 新元素总数（新 shape 各维乘积）
+        shape.begin(), shape.end(), size_t(1), std::multiplies<size_t>());
+    // 元素总数必须一致（view 不改变元素个数）。
+    CHECK_ARGUMENT(old_numel == new_numel, "View shape must preserve the number of elements");
+
+    // 申请一个和 shape 等长的 vector，用来放新步长。
+    std::vector<ptrdiff_t> new_strides(shape.size());
+
+    // ---------------- 情况 1：空张量（0 个元素） ----------------
+    // 没有元素，任何形状都合法（数据是空的，无所谓连续不连续）。
+    if (old_numel == 0) {
+        if (shape == _meta.shape) {   // 形状没变：直接沿用旧步长
+            new_strides = _meta.strides;
+        } else {                      // 形状变了：按新形状生成"连续步长"
+            // 从最后一维往前累乘，生成连续步长（和 create 里一样）。
+            ptrdiff_t stride = 1;
+            for (size_t i = shape.size(); i > 0; --i) {
+                new_strides[i - 1] = stride;
+                stride *= static_cast<ptrdiff_t>(shape[i - 1]);
+            }
+        }
+
+        // 构造新张量：共享同一 storage，offset 不变（数据本来就是空的）。
+        TensorMeta meta{_meta.dtype, shape, std::move(new_strides)};
+        return std::shared_ptr<Tensor>(new Tensor(std::move(meta), _storage, _offset));
+    }
+
+    // ---------------- 情况 2：旧形状为空（标量张量） ----------------
+    // 标量 = 0 维张量（只有一个元素，shape 是空 vector）。
+    // 元素就一个，怎么 view 都行：按新形状生成连续步长即可。
+    if (_meta.shape.empty()) {
+        ptrdiff_t stride = 1;
+        for (size_t i = shape.size(); i > 0; --i) {
+            new_strides[i - 1] = stride;
+            stride *= static_cast<ptrdiff_t>(shape[i - 1]);
+        }
+
+        TensorMeta meta{_meta.dtype, shape, std::move(new_strides)};
+        return std::shared_ptr<Tensor>(new Tensor(std::move(meta), _storage, _offset));
+    }
+
+    // -----------------------------------------------------------------------
+    // ---------------- 情况 3：常规情况 —— "块对齐"算法 ----------------
+    // 思路回顾：
+    //   从旧张量的最后一维往前扫描，把旧张量分解成若干"连续块"；
+    //   同时从新形状的最后一维往前"消耗"这些块，为每个新维度算出步长。
+    // -----------------------------------------------------------------------
+
+    // view_dim：当前正在处理的新形状维度的下标（从最后一维开始）。
+    // 用 ptrdiff_t 是因为它最后要递减到 -1（表示全部处理完），
+    // size_t 是 unsigned，减到 0 再减会变成巨大的数，判不了 < 0。
+    ptrdiff_t view_dim = static_cast<ptrdiff_t>(shape.size()) - 1;
+
+    // tensor_numel：当前旧"块"已累计的元素数（从 1 开始累乘）。
+    // view_numel：当前新维度已累计的元素数（从 1 开始累乘）。
+    size_t tensor_numel = 1;
+    size_t view_numel = 1;
+
+    // chunk_base_stride：当前块内的"基步长"——块内最细粒度那一步的长度。
+    // 初始取旧张量最后一维的步长（连续块的起点通常从最后一维开始）。
+    ptrdiff_t chunk_base_stride = _meta.strides.back();
+    // _meta.strides.back()：vector 的 back() 返回最后一个元素。
+
+    // 从旧最后一维往前扫描（i 从 shape.size() 递减到 1，dim = i-1）。
+    for (size_t i = _meta.shape.size(); i > 0; --i) {
+        const size_t tensor_dim = i - 1;
+        tensor_numel *= _meta.shape[tensor_dim];         // 累计当前旧块的大小
+
+        // 判断"块是否在此处结束"：
+        //   结束条件 1：已经到第 0 维（最前面，前面没有东西了）；
+        //   结束条件 2：当前维的"前一个维度"步长不等于"连续应走的步长"。
+        //     连续应走的步长 = 当前块累计元素数 × 基步长。
+        //     如果不相等，说明前一个维度的元素和本块不连续，块到此结束。
+        //   （shape[tensor_dim - 1] != 1 的检查：大小为 1 的维度不参与
+        //     连续性判断，理由同 isContiguous。）
+        const bool chunk_ends =
+            tensor_dim == 0
+            || (_meta.shape[tensor_dim - 1] != 1
+                && _meta.strides[tensor_dim - 1]
+                       != static_cast<ptrdiff_t>(tensor_numel) * chunk_base_stride);
+
+        if (!chunk_ends) {
+            continue;   // 块还没结束，继续向前累加（进入下一个循环）
+        }
+
+        // ---- 块结束：用这个块去"喂"新形状的维度 ----
+        // 从新形状的最后一维开始往前，只要满足下面两个条件之一，
+        // 就给当前新维度分配步长：
+        //   a) 当前新维度累计大小 < 块大小（还能继续填）；
+        //   b) 新维度大小为 1（单个元素的维度，怎么填都行）。
+        while (view_dim >= 0
+               && (view_numel < tensor_numel || shape[static_cast<size_t>(view_dim)] == 1)) {
+            // 新维度步长 = 当前累计元素数 × 基步长。
+            // 例：块大小 15，基步长 1，第一个新维度（最后一维）步长 = 1*1=1，
+            //     累加后 view_numel=shape[最后]，第二个新维度步长 = shape[最后]*1。
+            new_strides[static_cast<size_t>(view_dim)] =
+                static_cast<ptrdiff_t>(view_numel) * chunk_base_stride;
+            view_numel *= shape[static_cast<size_t>(view_dim)];          // 累加新维度大小
+            --view_dim;                                                  // 向前推进一个新维度
+        }
+
+        // 关键校验：块的大小必须恰好被新维度消耗完。
+        // 如果 view_numel != tensor_numel，说明这个块没能被新形状完整"吃掉"，
+        // 即新形状与旧内存布局不兼容（比如把非连续内存硬 reshape 成
+        // 一个不存在的连续形状），直接报错。
+        CHECK_ARGUMENT(view_numel == tensor_numel,
+                       "View shape is incompatible with the tensor's shape and strides");
+
+        // 如果后面还有更前面的旧维度（tensor_dim > 0）：
+        // 重置块统计（tensor_numel / view_numel 归 1），
+        // 并把基步长更新为"前一个维度的步长"（新的块从那里开始）。
+        if (tensor_dim > 0) {
+            chunk_base_stride = _meta.strides[tensor_dim - 1];
+            tensor_numel = 1;
+            view_numel = 1;
+        }
+    }
+
+    // 循环结束后，所有新维度都必须被分配完成（view_dim 应该推进到 -1）。
+    // 如果还有没分配的新维度，说明新形状太大/块不够用，不兼容。
+    CHECK_ARGUMENT(view_dim == -1,
+                   "View shape is incompatible with the tensor's shape and strides");
+
+    // 构造新张量：共享同一 storage（数据没动），offset 不变。
+    TensorMeta meta{_meta.dtype, shape, std::move(new_strides)};
+    return std::shared_ptr<Tensor>(new Tensor(std::move(meta), _storage, _offset));
 }
 
 // ---------------------------------------------------------------------------

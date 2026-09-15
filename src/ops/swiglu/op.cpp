@@ -43,7 +43,7 @@ void swiglu(tensor_t out, tensor_t gate, tensor_t up) {
         return cpu::swiglu(out->data(), gate->data(), up->data(), out->dtype(), numel);
 #ifdef ENABLE_NVIDIA_API
     case CHAOSUAN_DEVICE_NVIDIA:
-        TO_BE_IMPLEMENTED();
+        return nvidia::swiglu(out->data(), gate->data(), up->data(), out->dtype(), numel);
         return;
 #endif
     default:

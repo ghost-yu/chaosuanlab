@@ -52,7 +52,7 @@ void embedding(tensor_t out, tensor_t index, tensor_t weight) {
         return cpu::embedding(out->data(), index->data(), weight->data(), out->dtype(), numel, embedding_dim);
 #ifdef ENABLE_NVIDIA_API
     case CHAOSUAN_DEVICE_NVIDIA:
-        TO_BE_IMPLEMENTED();
+        return nvidia::embedding(out->data(), index->data(), weight->data(), out->dtype(), numel, embedding_dim);
         return;
 #endif
     default:

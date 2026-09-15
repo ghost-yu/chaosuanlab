@@ -28,7 +28,7 @@ void add(tensor_t c, tensor_t a, tensor_t b) {
         return cpu::add(c->data(), a->data(), b->data(), c->dtype(), c->numel());
 #ifdef ENABLE_NVIDIA_API
     case CHAOSUAN_DEVICE_NVIDIA:
-        TO_BE_IMPLEMENTED();   // 作业 4.2 填 nvidia::add(...)
+        return nvidia::add(c->data(), a->data(), b->data(), c->dtype(), c->numel());
         return;
 #endif
     default:

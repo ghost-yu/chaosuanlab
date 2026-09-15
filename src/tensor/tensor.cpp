@@ -410,11 +410,62 @@ bool Tensor::isContiguous() const {
 
 // ---------------------------------------------------------------------------
 // 【Task-1.4】permute(order)：维度重排（转置的推广）。
-// 见后续小问实现。
+//
+// 【什么是维度重排？】
+// 转置（transpose）是把 2×3 变成 3×2（第 0 维和第 1 维交换）。
+// permute 是更一般的操作：可以任意交换所有维度，比如把 (2,3,5) 按
+// 顺序 (2,0,1) 重排成 (5,2,3)。
+//
+// 【核心思想：不搬数据！】
+// permute 完全不复制、不移动任何元素，只做一件事：
+// 重新解释"形状"和"步长"——
+//   新形状的第 i 维   = 旧形状的第 order[i] 维；
+//   新步长的第 i 维   = 旧步长的第 order[i] 维；
+//   offset 不变（数据起点没动），storage 共享（内存还是那一块）。
+//
+// 例子：shape={2,3,5}, strides={15,5,1}，order={2,0,1}
+//   → 新 shape = {5,2,3}（旧第2维=5, 旧第0维=2, 旧第1维=3）
+//   → 新 strides = {1,15,5}
+//   元素访问公式不变：地址 = 起点 + Σ i_k * strides[k] * 元素大小。
+//
+// 注意：permute 之后张量通常**不再连续**（isContiguous() 返回 false），
+// 因为步长不再是"从后往前累乘"的规则了。
 // ---------------------------------------------------------------------------
 tensor_t Tensor::permute(const std::vector<size_t> &order) const {
-    TO_BE_IMPLEMENTED();
-    return std::shared_ptr<Tensor>(new Tensor(_meta, _storage));
+    // CHECK_ARGUMENT(条件, 消息)：条件不成立就抛异常。
+    // 这里校验 order 的长度必须等于张量维数（每个维度都要给出新位置）。
+    CHECK_ARGUMENT(order.size() == _meta.shape.size(),
+                   "Permute order must have the same number of dimensions as the tensor");
+
+    // 更细致的校验：
+    //   1. order 里的每个值必须 < 维数（不能越界，比如三维张量不能出现 3）；
+    //   2. order 里的值不能重复（每个维度只能去一个位置）。
+    // std::vector<bool> seen(order.size(), false)：申请一个 bool 数组，
+    // 全初始化为 false，用来标记"这个维度是否已经用过"。
+    std::vector<bool> seen(order.size(), false); // 用于检查重复维度
+    for (size_t d : order) {   // 范围 for：遍历 order 里的每个元素 d
+        CHECK_ARGUMENT(d < _meta.shape.size(),
+                       "Permute order contains an invalid dimension index");
+        CHECK_ARGUMENT(!seen[d],
+                       "Permute order contains a duplicate dimension");
+        seen[d] = true; // 标记该维度已被访问
+    }
+
+    // 重排形状和步长：
+    // 申请两个新 vector（长度和 order 一样）。
+    std::vector<size_t> new_shape(order.size());
+    std::vector<ptrdiff_t> new_strides(order.size());
+    for (size_t i = 0; i < order.size(); ++i) {
+        new_shape[i] = _meta.shape[order[i]];      // 新形状第 i 维 = 旧形状第 order[i] 维
+        new_strides[i] = _meta.strides[order[i]];  // 新步长同理
+    }
+
+    // 构造新 Tensor：共享同一 storage（不复制数据！），offset 不变。
+    // TensorMeta meta{...} 是聚合初始化；std::move 把 vector 移交避免复制。
+    // 第二个参数 _storage 直接传（shared_ptr 复制只会让引用计数 +1，
+    // 内存不会被复制也不会被释放——这正是"视图共享内存"的实现）。
+    TensorMeta meta{_meta.dtype, std::move(new_shape), std::move(new_strides)};
+    return std::shared_ptr<Tensor>(new Tensor(std::move(meta), _storage, _offset));
 }
 
 // ---------------------------------------------------------------------------

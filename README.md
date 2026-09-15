@@ -305,11 +305,11 @@ python test/test_infer.py --model [dir_path/to/model] --test
 
 提交并推送你的更改。你应该看到作业#3的测试都通过了。
 
-## 作业 #4：在 CHAOSUAN 中集成 CUDA，适配两款CUDA或类CUDA平台（以下统称 CUDA）
+## 作业 #4：在 CHAOSUAN 中集成 CUDA，适配 Nvidia 平台（以下统称 CUDA）
 
-需要选择 Nvidia、天数、摩尔、沐曦中的至少两款平台。
+本作业仅要求适配 Nvidia 平台，以 RTX 4090 为例完成验证。
 
-本次训练营提供了以上四种平台的算力，可以在官方进行申请算力，并用 CUDA 加速模型推理。在动手前，先深入理解 CHAOSUAN 框架。
+本次训练营提供 Nvidia（RTX 4090）平台的算力，可以在官方进行申请算力，并用 CUDA 加速模型推理。在动手前，先深入理解 CHAOSUAN 框架。
 
 事实上，CHAOSUAN 是一个支持同构硬件的框架。使用时，每个线程会创建一个线程唯一的 **Context** 对象，管理该线程使用的所有设备 **Runtime**。**Runtime** 对象是设备的资源管理器，**Context** 会为每个设备（以延迟初始化的方式）创建唯一的 **Runtime**。你可以用 ``setDevice`` 在不同设备间切换，每个线程同一时间只会激活一个设备。详情见 ``src/core/context.hpp``。
 

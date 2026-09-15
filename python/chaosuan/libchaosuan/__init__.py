@@ -12,6 +12,7 @@ from .chaosuan_types import chaosuanStream_t
 from .tensor import chaosuanTensor_t
 from .tensor import load_tensor
 from .ops import load_ops
+from .qwen2 import load_qwen2
 
 
 def load_shared_library():
@@ -38,6 +39,7 @@ LIB_CHAOSUAN = load_shared_library()
 load_runtime(LIB_CHAOSUAN)
 load_tensor(LIB_CHAOSUAN)
 load_ops(LIB_CHAOSUAN)
+load_qwen2(LIB_CHAOSUAN)
 
 
 __all__ = [

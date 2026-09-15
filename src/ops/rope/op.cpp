@@ -57,7 +57,8 @@ void rope(tensor_t out, tensor_t in, tensor_t pos_ids, float theta) {
                          seqlen, nheads, d);
 #ifdef ENABLE_NVIDIA_API
     case CHAOSUAN_DEVICE_NVIDIA:
-        TO_BE_IMPLEMENTED();
+        return nvidia::rope(out->data(), in->data(), pos_ids->data(), theta, out->dtype(),
+                           seqlen, nheads, d);
         return;
 #endif
     default:
